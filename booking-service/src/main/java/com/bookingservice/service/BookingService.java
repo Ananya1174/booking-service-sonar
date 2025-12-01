@@ -18,8 +18,18 @@ import org.springframework.web.server.ResponseStatusException;
 
 import java.time.Instant;
 import java.util.*;
-import java.util.stream.Collectors;
 
+/**
+ * BookingService - refactored to reduce cognitive complexity.
+ *
+ * Responsibilities split into:
+ *  - validateAndNormalizeRequest
+ *  - fetchFlightOrThrow
+ *  - ensureSeatAvailabilityOrThrow
+ *  - buildBookingEntity
+ *  - persistBooking
+ *  - convertToDto
+ */
 @Service
 public class BookingService {
 
@@ -46,7 +56,31 @@ public class BookingService {
                 headerEmail,
                 request == null ? null : request.getNumSeats());
 
-        // basic request validation
+        // validate and normalize incoming request (may set userEmail from header)
+        validateAndNormalizeRequest(request, headerEmail);
+
+        // fetch flight (may throw and trigger circuit-breaker)
+        FlightDto flight = fetchFlightOrThrow(request.getFlightId());
+
+        // ensure seats available (no need to store result — method throws if not enough)
+        ensureSeatAvailabilityOrThrow(flight, request.getNumSeats());
+
+        // price calculation
+        double totalPrice = calculateTotalPrice(flight.getPrice(), request.getNumSeats());
+
+        // build entity and persist
+        Booking booking = buildBookingEntity(request, totalPrice);
+        Booking saved = persistBookingOrThrow(booking);
+
+        log.info("Booking saved: pnr={}, flightId={}, user={}", 
+                saved.getPnr(), saved.getFlightId(), saved.getUserEmail());
+
+        return convertToDto(saved);
+    }
+
+    /* ---------- helpers (extracted to reduce cognitive complexity) ---------- */
+
+    private void validateAndNormalizeRequest(BookingRequest request, String headerEmail) {
         if (request == null) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Request body is required");
         }
@@ -62,17 +96,14 @@ public class BookingService {
                     "Header user email must match request userEmail");
         }
 
-        // validate flightId
         if (request.getFlightId() == null) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "flightId is required");
         }
 
-        // validate numSeats
         if (request.getNumSeats() == null || request.getNumSeats() <= 0) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "numSeats must be provided and > 0");
         }
 
-        // validate passengers
         if (request.getPassengers() == null || request.getPassengers().isEmpty()) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "passengers list is required and cannot be empty");
         }
@@ -80,36 +111,53 @@ public class BookingService {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
                     "number of passengers must match numSeats");
         }
+    }
 
-        // call flight service (Feign). This may throw exceptions which will trigger circuit-breaker
-        FlightDto flight;
+    private FlightDto fetchFlightOrThrow(Long flightId) {
         try {
-            flight = flightClient.getFlightById(request.getFlightId());
+            FlightDto flight = flightClient.getFlightById(flightId);
+
+            if (flight == null) {
+                throw new ResponseStatusException(
+                        HttpStatus.NOT_FOUND,
+                        "Flight not found: " + flightId
+                );
+            }
+
+            return flight;
+
+        } catch (ResponseStatusException rse) {
+            log.warn("Flight service returned an error for flightId={}: {}", flightId, rse.getReason());
+            throw rse; // keeps original status
         } catch (Exception ex) {
-            log.warn("Error calling flight service for id {}: {}", request.getFlightId(), ex.toString());
-            // rethrow to let circuit breaker handle it (fallback invoked)
-            throw ex;
+            log.error("Unexpected error calling flight service for flightId={}", flightId, ex);
+            throw new ResponseStatusException(
+                    HttpStatus.SERVICE_UNAVAILABLE,
+                    "Error contacting flight service for flightId=" + flightId,
+                    ex
+            );
         }
+    }
 
-        if (flight == null) {
-            throw new ResponseStatusException(HttpStatus.NOT_FOUND,
-                    "Flight not found: " + request.getFlightId());
-        }
-
-        // check seat availability
+    private long ensureSeatAvailabilityOrThrow(FlightDto flight, Integer requestedSeats) {
         long availableSeats = Optional.ofNullable(flight.getSeats()).orElse(Collections.emptyList())
                 .stream()
                 .filter(s -> s.getStatus() != null && "AVAILABLE".equalsIgnoreCase(s.getStatus()))
                 .count();
 
-        if (availableSeats < request.getNumSeats()) {
+        if (availableSeats < requestedSeats) {
             throw new ResponseStatusException(HttpStatus.CONFLICT,
-                    "Not enough seats available: requested=" + request.getNumSeats() + ", available=" + availableSeats);
+                    "Not enough seats available: requested=" + requestedSeats + ", available=" + availableSeats);
         }
+        return availableSeats;
+    }
 
-        // calculate total price
-        double totalPrice = (flight.getPrice() == null ? 0.0 : flight.getPrice()) * request.getNumSeats();
+    private double calculateTotalPrice(Double pricePerSeat, Integer numSeats) {
+        double price = (pricePerSeat == null) ? 0.0 : pricePerSeat;
+        return price * numSeats;
+    }
 
+    private Booking buildBookingEntity(BookingRequest request, double totalPrice) {
         Booking booking = new Booking();
         booking.setPnr(generatePnr());
         booking.setFlightId(request.getFlightId());
@@ -119,7 +167,6 @@ public class BookingService {
         booking.setStatus("ACTIVE");
         booking.setCreatedAt(Instant.now());
 
-        // map passengers into entity objects
         List<Passenger> passengers = request.getPassengers().stream().map(pdto -> {
             Passenger p = new Passenger();
             p.setPassengerName(pdto.getName());
@@ -129,21 +176,19 @@ public class BookingService {
             p.setMealPreference(pdto.getMealPreference());
             p.setBooking(booking);
             return p;
-        }).collect(Collectors.toList());
+        }).toList();
 
         booking.setPassengers(passengers);
+        return booking;
+    }
 
-        Booking saved;
+    private Booking persistBookingOrThrow(Booking booking) {
         try {
-            saved = bookingRepository.save(booking);
+            return bookingRepository.save(booking);
         } catch (Exception ex) {
             log.error("Failed to save booking to DB: {}", ex.toString(), ex);
             throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to save booking");
         }
-
-        log.info("Booking saved: pnr={}, flightId={}, user={}", saved.getPnr(), saved.getFlightId(), saved.getUserEmail());
-
-        return convertToDto(saved);
     }
 
     /**
@@ -159,6 +204,8 @@ public class BookingService {
                 "Flight service unavailable. Try again later.");
     }
 
+    /* ---------- existing methods unchanged ---------- */
+
     @Transactional(readOnly = true)
     public BookingResponseDto getByPnr(String pnr) {
         Booking booking = bookingRepository.findByPnr(pnr)
@@ -169,7 +216,7 @@ public class BookingService {
     @Transactional(readOnly = true)
     public List<BookingResponseDto> getHistoryByEmail(String email) {
         List<Booking> list = bookingRepository.findByUserEmailOrderByCreatedAtDesc(email);
-        return list.stream().map(this::convertToDto).collect(Collectors.toList());
+        return list.stream().map(this::convertToDto).toList();
     }
 
     @Transactional
@@ -204,7 +251,6 @@ public class BookingService {
         dto.setStatus(b.getStatus());
         dto.setCreatedAt(b.getCreatedAt());
 
-        // map to PersonDto (used inside BookingResponseDto in your code)
         List<PersonDto> pinfos = Optional.ofNullable(b.getPassengers()).orElse(Collections.emptyList())
                 .stream().map(p -> PersonDto.builder()
                         .name(p.getPassengerName())
@@ -213,13 +259,17 @@ public class BookingService {
                         .seatNumber(p.getSeatNumber())
                         .mealPreference(p.getMealPreference())
                         .build())
-                .collect(Collectors.toList());
+                .toList();
 
         dto.setPassengers(pinfos);
         return dto;
     }
 
     private String generatePnr() {
-        return UUID.randomUUID().toString().replaceAll("-", "").substring(0, 8).toUpperCase();
+        return UUID.randomUUID()
+                .toString()
+                .replace("-", "")   // ✔ faster, no regex
+                .substring(0, 8)
+                .toUpperCase();
     }
 }

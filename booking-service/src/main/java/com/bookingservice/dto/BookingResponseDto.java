@@ -1,6 +1,5 @@
 package com.bookingservice.dto;
 
-import com.bookingservice.dto.PersonDto;
 import java.time.Instant;
 import java.util.List;
 import lombok.*;
